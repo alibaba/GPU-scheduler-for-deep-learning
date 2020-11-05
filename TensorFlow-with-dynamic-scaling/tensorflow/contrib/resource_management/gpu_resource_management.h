@@ -45,6 +45,25 @@ class GPUResourceManagement : public SessionRunAction {
   // Disable the GPUResourceManagement feature.
   void DisableGPUResourceManagement();
 
+  // Get the estimated total idle time.
+  uint64 GetEstimatedIdleTime() {
+    return estimated_total_idle_time_;
+  }
+
+  // Get the current total idle time.
+  void SetEstimatedIdleTime(uint64 idle_time) {
+    mutex_lock l(idle_time_mu_);
+    estimated_total_idle_time_ = idle_time;
+  }
+
+  // Get the total number of queued GPU op running in
+  // the giving executor.
+  uint64 GetExecutorQueuedOpNum(const void* executor_ptr);
+
+  // Set the total number of queued GPU op running in
+  // the giving executor.
+  void SetExecutorQueuedOpNum(const void* executor_ptr, uint64 queued_op_num);
+
  private:
   // Adjust the GPU usage limit of this job.
   // void AdjustUsage();
@@ -60,6 +79,7 @@ class GPUResourceManagement : public SessionRunAction {
 
   mutable mutex manage_mu_;
   mutable mutex usage_mu_;
+  mutable mutex idle_time_mu_;
 
   std::string gpu_resource_manage_file_path_;
 
@@ -74,6 +94,16 @@ class GPUResourceManagement : public SessionRunAction {
   // For recording the parsed new gpu performance limitation
   // (if the value is 0, then it means to suspend this job).
   std::atomic<int> gpu_perf_control_;
+
+  // For recording the total time of all inserted time slot.
+  uint64 total_time_slot_;
+
+  // For recording the estimated total idle time.
+  uint64 estimated_total_idle_time_;
+
+  // For recording the total number of queued GPU op running in
+  // the specified executor.
+  std::unordered_map<const void*, uint64> executor_queued_op_num_;
 
   // Determine if we need to adjust the GPU usage limit.
   std::atomic<bool> need_to_adjust_memory_;

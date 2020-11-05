@@ -3282,6 +3282,7 @@ tf_cuda_library(
         "//tensorflow/core/grappler/utils:functions",
         "//tensorflow/core/profiler/lib:traceme",
         "//tensorflow/core/profiler/internal:traceme_recorder",
+        "//tensorflow/contrib/resource_management:gpu_resource_management",
     ] + mkl_deps(),
     alwayslink = 1,
 )

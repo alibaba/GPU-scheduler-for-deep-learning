@@ -17,8 +17,10 @@ limitations under the License.
 
 #include <atomic>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -28,6 +30,7 @@ limitations under the License.
 #include "tensorflow/core/common_runtime/executor_factory.h"
 #include "tensorflow/core/common_runtime/pending_counts.h"
 #include "tensorflow/core/common_runtime/renamed_device.h"
+#include "tensorflow/core/common_runtime/session_run_action_registry.h"
 #include "tensorflow/core/common_runtime/step_stats_collector.h"
 #include "tensorflow/core/framework/allocation_description.pb.h"
 #include "tensorflow/core/framework/allocator.h"
@@ -71,6 +74,10 @@ limitations under the License.
 #include "tensorflow/core/profiler/internal/traceme_recorder.h"
 #include "tensorflow/core/profiler/lib/traceme.h"
 #include "tensorflow/core/util/tensor_slice_reader_cache.h"
+#include "tensorflow/contrib/resource_management/gpu_resource_management.h"
+
+const int default_op_num = 100;
+const int default_check_interval = 1;
 
 namespace tensorflow {
 namespace {
@@ -80,6 +87,20 @@ static const Tensor* const kEmptyTensor = new Tensor;
 
 bool IsInitializationOp(const Node* node) {
   return node->op_def().allows_uninitialized_input();
+}
+
+// Get the instance of the GPUResourceManagement action.
+GPUResourceManagement* GetGPUResourceManagement() {
+  GPUResourceManagement* rm = nullptr;
+  SessionRunAction* act =
+      SessionRunActionRegistry::Global()->GetAction(
+          SessionRunActionRegistry::POST_SESSION_RUN, 2,
+          "GPUResourceManagement");
+  if (act == nullptr) {
+    return nullptr;
+  }
+  rm = dynamic_cast<GPUResourceManagement *>(act);
+  return rm;
 }
 
 // Helper routines for collecting step stats.
@@ -1302,6 +1323,25 @@ class ExecutorState {
   // name of the new frame from nodedef.
   gtl::FlatMap<string, FrameState*> outstanding_frames_ GUARDED_BY(mu_);
 
+  // The manager thread which is in charge of inserting the time slot
+  // before launching async GPU op.
+  std::thread* gpu_op_manager_thread_;
+
+  // The flag to control the manager thread.
+  bool terminate_op_magager_thread_;
+
+  mutable mutex async_gpu_op_queue_lock_;
+
+  // For recording all the queued GPU op.
+  std::vector<std::function<void(void)>> async_gpu_op_queue;
+
+  // The number of queued async gpu op.
+  std::atomic<uint64> num_queued_op;
+
+  // The flag to control whether to insert a idle time before
+  // launching a queued gpu op.
+  std::atomic<bool> need_to_insert_idle_time_;
+
   // The unique name of a frame.
   inline string MakeFrameName(FrameState* frame, int64 iter_id,
                               const string& name) {
@@ -1323,6 +1363,13 @@ class ExecutorState {
 
   // Process a ready node in current thread.
   void Process(TaggedNode node, int64 scheduled_nsec);
+
+  // The manager thread which is in charge of inserting the time slot
+  // before launching each queued async GPU op.
+  void AsyncGPUOpManager();
+
+  // Reture whether the async_gpu_op_queue is empty.
+  bool IsAsyncGPUOpQueueEmpty();
 
   // Before invoking item->kernel, fills in its "inputs".
   Status PrepareInputs(const NodeItem& item, Entry* first_input,
@@ -1404,7 +1451,23 @@ ExecutorState::ExecutorState(const Executor::Args& args, ExecutorImpl* impl)
       cancellation_manager_(args.cancellation_manager),
       runner_(args.runner),
       sync_on_finish_(args.sync_on_finish),
-      num_outstanding_ops_(0) {
+      num_outstanding_ops_(0),
+      gpu_op_manager_thread_(nullptr),
+      terminate_op_magager_thread_(false),
+      num_queued_op(0),
+      need_to_insert_idle_time_(false) {
+
+  bool enable_op_management = false;
+  GPUResourceManagement* rm = GetGPUResourceManagement();
+  if (rm != nullptr) {
+    enable_op_management = (rm->GetEstimatedIdleTime() > 0);
+  }
+
+  if (enable_op_management && gpu_op_manager_thread_ == nullptr) {
+    gpu_op_manager_thread_ =
+      new std::thread(&ExecutorState::AsyncGPUOpManager, this);
+  }
+
   if (args.user_intra_op_threadpool != nullptr) {
     Device* device = impl_->params_.device;
     user_device_ = RenamedDevice::NewRenamedDevice(
@@ -1434,6 +1497,54 @@ ExecutorState::~ExecutorState() {
     it->Unref();
   }
   delete slice_reader_cache_;
+}
+
+// The manager thread which is in charge of inserting the time slot
+// before launching each queued async GPU op.
+void ExecutorState::AsyncGPUOpManager() {
+  uint64 sleep_time_us = 0;
+  need_to_insert_idle_time_ = false;
+  GPUResourceManagement* rm = GetGPUResourceManagement();
+  if (rm == nullptr) {
+    return;
+  }
+
+  while (!terminate_op_magager_thread_) {
+    need_to_insert_idle_time_ = rm->GetEstimatedIdleTime() > 0 ? true : false;
+
+    std::function<void(void)> queued_call_func = nullptr;
+    async_gpu_op_queue_lock_.lock();
+    if (!async_gpu_op_queue.empty()) {
+      queued_call_func = async_gpu_op_queue.front();
+    }
+    async_gpu_op_queue_lock_.unlock();
+
+    if (queued_call_func != nullptr) {
+      queued_call_func();
+      async_gpu_op_queue_lock_.lock();
+      if (!async_gpu_op_queue.empty()) {
+        async_gpu_op_queue.erase(async_gpu_op_queue.begin());
+        num_queued_op.fetch_sub(1);
+      }
+      async_gpu_op_queue_lock_.unlock();
+
+      // Estimate idle time
+      uint64 idle_time = rm->GetEstimatedIdleTime();
+      uint64 queued_op_num = rm->GetExecutorQueuedOpNum(impl_);
+      idle_time = queued_op_num > 0 ? (idle_time / queued_op_num) : 0;
+      usleep(idle_time);
+      uint64 remain_time = rm->GetEstimatedIdleTime();
+      remain_time = remain_time > idle_time ? (remain_time - idle_time) : 0;
+      rm->SetEstimatedIdleTime(remain_time);
+    }
+    usleep(default_check_interval);
+  }
+  return;
+}
+
+bool ExecutorState::IsAsyncGPUOpQueueEmpty() {
+  mutex_lock l(async_gpu_op_queue_lock_);
+  return async_gpu_op_queue.empty();
 }
 
 Status ExecutorImpl::BuildControlFlowInfo(const Graph* g,
@@ -1681,7 +1792,17 @@ void ExecutorState::Process(TaggedNode tagged_node, int64 scheduled_nsec) {
   EntryVector outputs;
   bool completed = false;
   inline_ready.push_back(tagged_node);
-  while (!inline_ready.empty()) {
+  uint64 sess_op_num = 0;
+  while (!IsAsyncGPUOpQueueEmpty() || !inline_ready.empty()) {
+    while (!IsAsyncGPUOpQueueEmpty() && inline_ready.empty()) {
+      usleep(default_check_interval);
+    }
+    if (inline_ready.empty()) {
+      //we don't need to call ScheduleFinish() here since we call it
+      // at the end of the ExecutorState::Process().
+      break;
+    }
+
     tagged_node = inline_ready.front();
     inline_ready.pop_front();
     const Node* node = tagged_node.node;
@@ -1758,68 +1879,151 @@ void ExecutorState::Process(TaggedNode tagged_node, int64 scheduled_nsec) {
 
       if (item.kernel_is_async) {
         // Asynchronous computes.
-        AsyncOpKernel* async = item.kernel->AsAsync();
-        DCHECK(async != nullptr);
         launched_asynchronously = true;
-        AsyncState* state =
-            new AsyncState(params, tagged_node, &item, first_input, stats);
+        Device* kernel_device = impl_->params_.device;
 
-        auto done = [this, state]() {
-          Device* device = impl_->params_.device;
-          NodeExecStatsInterface* stats = state->stats;  // Shorthand
-          Entry* first_input = state->first_input;       // Shorthand
+        // Only enqueue this op if it is an async GPU op.
+        if (need_to_insert_idle_time_ && (kernel_device->name()).find("GPU") != string::npos) {
+          // Enqueue this GPU op therefore we can insert a time slot before launching this op.
+          sess_op_num++;
 
-          nodestats::SetOpEnd(stats);
-          EntryVector outputs;
-          Status s = ProcessOutputs(*state->item, &state->ctx, &outputs, stats);
-          nodestats::SetMemory(stats, &state->ctx);
-          if (vlog_) {
-            VLOG(2) << "Async kernel done: " << state->item->node->id()
-                    << " step " << step_id_ << " "
-                    << SummarizeNode(*state->item->node)
-                    << (state->tagged_node.is_dead ? " is dead" : "")
-                    << " device: " << device->name();
-          }
+          const GraphView& gview_t = impl_->gview_;
+          const NodeItem& item_t = *gview_t.node(id);
+          AsyncState* state =
+              new AsyncState(params, tagged_node, &item_t, first_input, stats);
 
-          // Clears inputs.
-          const int num_inputs = state->item->num_inputs;
-          for (int i = 0; i < num_inputs; ++i) {
-            (first_input + i)->ClearVal();
+          auto async_gpu_kernel = [this, state, id, stats, op_kernel, device] {
+            AsyncOpKernel* async = state->item->kernel->AsAsync();
+
+            DCHECK(async != nullptr);
+            auto done = [this, state]() {
+              Device* device = impl_->params_.device;
+              NodeExecStatsInterface* stats = state->stats;  // Shorthand
+              Entry* first_input = state->first_input;     // Shorthand
+
+              nodestats::SetOpEnd(stats);
+              EntryVector outputs;
+              Status s = ProcessOutputs(*state->item, &state->ctx, &outputs, stats);
+              nodestats::SetMemory(stats, &state->ctx);
+              if (vlog_) {
+                VLOG(2) << "Async kernel done: " << state->item->node->id()
+                        << " step " << step_id_ << " "
+                        << SummarizeNode(*state->item->node)
+                        << (state->tagged_node.is_dead ? " is dead" : "")
+                        << " device: " << device->name();
+              }
+
+              // Clears inputs.
+              const int num_inputs = state->item->num_inputs;
+              for (int i = 0; i < num_inputs; ++i) {
+                (first_input + i)->ClearVal();
+              }
+              FrameState* input_frame = state->tagged_node.input_frame;
+              const int64 input_iter = state->tagged_node.input_iter;
+              const int id = state->tagged_node.node->id();
+              MaybeMarkCompleted(input_frame, input_iter, id);
+              TaggedNodeSeq ready;
+              if (s.ok()) {
+                PropagateOutputs(state->tagged_node, state->item, &outputs, &ready);
+              }
+              outputs.clear();
+              if (s.ok() && impl_->device_record_tensor_accesses_) {
+                // Get the list of all tensors accessed during the execution
+                TensorReferenceVector accessed;
+                state->ctx.retrieve_accessed_tensors(&accessed);
+                nodestats::SetReferencedTensors(stats, accessed);
+                // callee takes ownership of the vector
+                device->ConsumeListOfAccessedTensors(state->ctx.op_device_context(),
+                                                    accessed);
+              }
+              const bool completed =
+                  NodeDone(s, state->item->node, ready, stats, nullptr);
+              delete state;
+              if (completed) ScheduleFinish();
+            };
+            nodestats::SetOpStart(stats);
+            {
+              profiler::TraceMe activity(
+                  [&] {
+                    return strings::StrCat(
+                        op_kernel->name(), ":", op_kernel->type_string(),
+                        "#id=", step_container_ ? step_container_->step_id() : 0,
+                        ",device=", device->name(), ",async=true#");
+                  },
+                  profiler::GetTFTraceMeLevel(op_kernel->IsExpensive()));
+              device->ComputeAsync(async, &state->ctx, done);
+            }
+          };
+
+          // Enqueue this asyn GPU op.
+          async_gpu_op_queue_lock_.lock();
+          async_gpu_op_queue.emplace_back(async_gpu_kernel);
+          num_queued_op.fetch_add(1);
+          async_gpu_op_queue_lock_.unlock();
+        } else {
+          // Do not enqueue this op.
+          AsyncOpKernel* async = item.kernel->AsAsync();
+          DCHECK(async != nullptr);
+          AsyncState* state =
+              new AsyncState(params, tagged_node, &item, first_input, stats);
+
+          auto done = [this, state]() {
+            Device* device = impl_->params_.device;
+            NodeExecStatsInterface* stats = state->stats;  // Shorthand
+            Entry* first_input = state->first_input;       // Shorthand
+
+            nodestats::SetOpEnd(stats);
+            EntryVector outputs;
+            Status s = ProcessOutputs(*state->item, &state->ctx, &outputs, stats);
+            nodestats::SetMemory(stats, &state->ctx);
+            if (vlog_) {
+              VLOG(2) << "Async kernel done: " << state->item->node->id()
+                      << " step " << step_id_ << " "
+                      << SummarizeNode(*state->item->node)
+                      << (state->tagged_node.is_dead ? " is dead" : "")
+                      << " device: " << device->name();
+            }
+
+            // Clears inputs.
+            const int num_inputs = state->item->num_inputs;
+            for (int i = 0; i < num_inputs; ++i) {
+              (first_input + i)->ClearVal();
+            }
+            FrameState* input_frame = state->tagged_node.input_frame;
+            const int64 input_iter = state->tagged_node.input_iter;
+            const int id = state->tagged_node.node->id();
+            MaybeMarkCompleted(input_frame, input_iter, id);
+            TaggedNodeSeq ready;
+            if (s.ok()) {
+              PropagateOutputs(state->tagged_node, state->item, &outputs, &ready);
+            }
+            outputs.clear();
+            if (s.ok() && impl_->device_record_tensor_accesses_) {
+              // Get the list of all tensors accessed during the execution
+              TensorReferenceVector accessed;
+              state->ctx.retrieve_accessed_tensors(&accessed);
+              nodestats::SetReferencedTensors(stats, accessed);
+              // callee takes ownership of the vector
+              device->ConsumeListOfAccessedTensors(state->ctx.op_device_context(),
+                                                  accessed);
+            }
+            const bool completed =
+                NodeDone(s, state->item->node, ready, stats, nullptr);
+            delete state;
+            if (completed) ScheduleFinish();
+          };
+          nodestats::SetOpStart(stats);
+          {
+            profiler::TraceMe activity(
+                [&] {
+                  return strings::StrCat(
+                      op_kernel->name(), ":", op_kernel->type_string(),
+                      "#id=", step_container_ ? step_container_->step_id() : 0,
+                      ",device=", device->name(), ",async=true#");
+                },
+                profiler::GetTFTraceMeLevel(op_kernel->IsExpensive()));
+            device->ComputeAsync(async, &state->ctx, done);
           }
-          FrameState* input_frame = state->tagged_node.input_frame;
-          const int64 input_iter = state->tagged_node.input_iter;
-          const int id = state->tagged_node.node->id();
-          MaybeMarkCompleted(input_frame, input_iter, id);
-          TaggedNodeSeq ready;
-          if (s.ok()) {
-            PropagateOutputs(state->tagged_node, state->item, &outputs, &ready);
-          }
-          outputs.clear();
-          if (s.ok() && impl_->device_record_tensor_accesses_) {
-            // Get the list of all tensors accessed during the execution
-            TensorReferenceVector accessed;
-            state->ctx.retrieve_accessed_tensors(&accessed);
-            nodestats::SetReferencedTensors(stats, accessed);
-            // callee takes ownership of the vector
-            device->ConsumeListOfAccessedTensors(state->ctx.op_device_context(),
-                                                 accessed);
-          }
-          const bool completed =
-              NodeDone(s, state->item->node, ready, stats, nullptr);
-          delete state;
-          if (completed) ScheduleFinish();
-        };
-        nodestats::SetOpStart(stats);
-        {
-          profiler::TraceMe activity(
-              [&] {
-                return strings::StrCat(
-                    op_kernel->name(), ":", op_kernel->type_string(),
-                    "#id=", step_container_ ? step_container_->step_id() : 0,
-                    ",device=", device->name(), ",async=true#");
-              },
-              profiler::GetTFTraceMeLevel(op_kernel->IsExpensive()));
-          device->ComputeAsync(async, &state->ctx, done);
         }
       } else {
         // Synchronous computes.
@@ -1894,6 +2098,14 @@ void ExecutorState::Process(TaggedNode tagged_node, int64 scheduled_nsec) {
       completed = NodeDone(s, item.node, ready, stats, &inline_ready);
     }
   }  // while !inline_ready.empty()
+
+  if (sess_op_num > 0) {
+    // Record the total number of the queued op running in this session.
+    GPUResourceManagement* rm = GetGPUResourceManagement();
+    if (rm != nullptr) {
+      rm->SetExecutorQueuedOpNum(impl_, sess_op_num);
+    }
+  }
 
   // This thread of computation is done if completed = true.
   if (completed) ScheduleFinish();
@@ -2480,6 +2692,16 @@ void ExecutorState::Finish() {
   mu_.unlock();
   CHECK(done_cb != nullptr);
   Device* device = impl_->params_.device;
+
+  // Stop the op manager thread.
+  if (gpu_op_manager_thread_ != nullptr) {
+    terminate_op_magager_thread_ = true;
+    if (gpu_op_manager_thread_->joinable()) {
+      gpu_op_manager_thread_->join();
+    }
+    delete gpu_op_manager_thread_;
+    terminate_op_magager_thread_ = false;
+  }
 
   // There are several potential race conditions below. To name a few:
   // 1. Even if the device's status is OK at the precise moment when

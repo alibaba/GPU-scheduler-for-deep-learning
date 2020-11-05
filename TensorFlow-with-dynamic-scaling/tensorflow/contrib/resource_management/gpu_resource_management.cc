@@ -17,11 +17,15 @@ limitations under the License.
 #include "tensorflow/core/platform/logging.h"
 #include "tensorflow/core/util/env_var.h"
 
+const int fixed_cost = 50; //us
+
 namespace tensorflow {
 
 GPUResourceManagement::GPUResourceManagement()
     : need_to_adjust_memory_(false),
     gpu_perf_control_(100),
+    estimated_total_idle_time_(0),
+    total_time_slot_(0),
     gpu_usage_adjustment_(new GPUUsageAdjustment()) {
   ReadStringFromEnvVar("GPU_CONFIG_FILE", "", &gpu_resource_manage_file_path_);
   if (gpu_resource_manage_file_path_.empty()) {
@@ -143,6 +147,8 @@ void GPUResourceManagement::DisableGPUResourceManagement() {
 void GPUResourceManagement::DoSleepOrSuspend(
     uint64 sess_duration_us) {
   if (gpu_perf_control_ >= 100) {
+    total_time_slot_ = 0;
+    SetEstimatedIdleTime(0);
     return;
   }
   if (gpu_perf_control_ == 0) {
@@ -151,12 +157,22 @@ void GPUResourceManagement::DoSleepOrSuspend(
       usleep(100);
     }
   } else {
-    // Need to sleep a specific time after each SessionRun.
-    uint64 sleep_time =
-        sess_duration_us * 100 / gpu_perf_control_;
-    if (sleep_time > sess_duration_us) {
-      sleep_time -= sess_duration_us;
+    // Need to sleep a specific time after each SessionRun
+    // if we don't insert enough time slots.
+    uint64 actual_sleep_time = total_time_slot_ > estimated_total_idle_time_ ?
+        (total_time_slot_ - estimated_total_idle_time_) : 0;
+    uint64 actual_sess_run_time = sess_duration_us > actual_sleep_time ?
+        (sess_duration_us - actual_sleep_time) : 1;
+    uint64 total_time = actual_sess_run_time * 100 / gpu_perf_control_;
+
+    if (total_time > sess_duration_us + fixed_cost) {
+      uint64 sleep_time = total_time - sess_duration_us - fixed_cost;
+      SetEstimatedIdleTime(sleep_time);
+      total_time_slot_ = sleep_time;
       usleep(sleep_time);
+    } else {
+      SetEstimatedIdleTime(0);
+      total_time_slot_ = 0;
     }
   }
 }
@@ -184,6 +200,25 @@ Status GPUResourceManagement::RunAction(
   DoSleepOrSuspend(options.sess_duration_us);
 
   return Status::OK();
+}
+
+uint64 GPUResourceManagement::GetExecutorQueuedOpNum(const void* executor_ptr) {
+  auto ec = executor_queued_op_num_.find(executor_ptr);
+  if (ec != executor_queued_op_num_.end()) {
+    return ec->second;
+  }
+  return 0;
+}
+
+void GPUResourceManagement::SetExecutorQueuedOpNum(const void* executor_ptr, uint64 queued_op_num) {
+  auto ec = executor_queued_op_num_.find(executor_ptr);
+  if (ec != executor_queued_op_num_.end()) {
+    if (queued_op_num > ec->second) {
+      ec->second = queued_op_num;
+    }
+  } else {
+    executor_queued_op_num_.emplace(executor_ptr, queued_op_num);
+  }
 }
 
 
