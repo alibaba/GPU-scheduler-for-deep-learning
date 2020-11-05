@@ -1,3 +1,14 @@
+# README
+
+This repository contains our customized version of TensorFlow which contains the dynamic scaling mechanism of AntMan paper ([OSDI'20](https://www.usenix.org/conference/osdi20/presentation/xiao)).
+
+The modification of TensorFlow is mostly in three components: memory allocator, executor, and interfaces. To enable dynamic universal memory, BFCAllocator is modified to introduce an adjustable upper limit for memory. The memory allocator keeps track of the total bytes of memory allocation and triggers out-of-memory when total bytes exceed the upper limit. A new universal memory allocator, GPUVMemAllocator, is also added to wrap the GPU memory allocator and host memory allocator (i.e., using cudaHostMalloc for memory allocation). When a memory allocation is triggered by the request of a tensor, GPUVMemAllocator tries to allocate the memory using the GPU memory allocator and treats the CPU memory allocator as a backup if there is insufficient GPU memory left over. Note that, the GPUVMemAllocator maintains a set data structure that records the pointers of memory regions allocated by GPU, which is used to classify the memory pointers for de-allocation.
+
+To enable dynamic computation unit scaling, a GpuOpManager with an operator processing queue, which runs in a standalone thread, is introduced in TensorFlow. The operator executor of TensorFlow is modified accordingly to insert GPU operators to GpuOpManager queue in order so as to dedicate the execution of GPU operators to it. GpuOpManager may delay the actual execution of the GPU operators based on a limited percentage of the computation capacity.
+
+The statistics of memory usage patterns and the execution information are aggregated for the local coordinator. The DL frameworks and local coordinator communicate through the file system. They both have a monitor thread to check the file for receiving either job statistics or control signals. To minimize the overhead of memory management, the dynamic scaling of memory is triggered at the mini-batch boundaries (end of session.run()).
+
+
 <div align="center">
   <img src="https://www.tensorflow.org/images/tf_logo_social.png">
 </div>
