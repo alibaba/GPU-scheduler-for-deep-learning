@@ -1,0 +1,18 @@
+language: go
+
+go:
+  - "1.13"
+
+go_import_path: github.com/alibaba/kubedl
+
+before_script:
+  - go mod download
+  - chmod +x ./scripts/docker_build_daily.sh
+
+script:
+  - export KUBEDL_CI=true
+  - make test
+
+after_script:
+  - rm -f ./cover.out
+  - ./scripts/docker_build_daily.sh
