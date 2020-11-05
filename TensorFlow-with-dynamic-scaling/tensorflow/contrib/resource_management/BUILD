@@ -91,3 +91,16 @@ tf_cuda_cc_test(
         "//tensorflow/core:protos_all_cc",
     ],
 )
+
+tf_cuda_library(
+    name = "gpu_statistics",
+    srcs = ["gpu_statistics.cc"],
+    hdrs = ["gpu_statistics.h"],
+    copts = ["-I/usr/include/"],
+    linkopts = ["-L/usr/lib64/", "-lcrypto"],
+    deps = [
+        "//tensorflow/core:gpu_runtime",
+        "//tensorflow/core:lib",
+        "@jsoncpp_git//:jsoncpp",
+    ],
+)
