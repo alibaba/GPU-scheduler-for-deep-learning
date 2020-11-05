@@ -36,6 +36,7 @@ limitations under the License.
 #include "tensorflow/core/common_runtime/process_util.h"
 #include "tensorflow/core/common_runtime/rendezvous_mgr.h"
 #include "tensorflow/core/common_runtime/scoped_allocator_mgr.h"
+#include "tensorflow/core/common_runtime/session_run_action_registry.h"
 #include "tensorflow/core/common_runtime/step_stats_collector.h"
 #include "tensorflow/core/framework/function.h"
 #include "tensorflow/core/framework/graph.pb_text.h"
@@ -494,6 +495,14 @@ Status DirectSession::RunInternal(
     const thread::ThreadPoolOptions& threadpool_options) {
   const uint64 start_time_usecs = options_.env->NowMicros();
   const int64 executor_step_count = executors_and_keys->step_count.fetch_add(1);
+
+  // Running all pre session run action in grouping
+  SessionRunActionOptions action_options;
+  action_options.device_mgr = &device_mgr_;
+  action_options.sess_ptr = this;
+  TF_RETURN_IF_ERROR(SessionRunActionRegistry::Global()->RunGrouping(
+      SessionRunActionRegistry::PRE_SESSION_RUN, action_options));
+
   RunState run_state(step_id, &devices_);
 
   profiler::TraceMe activity(
@@ -763,7 +772,15 @@ Status DirectSession::RunInternal(
       exec_and_lib.graph->ToGraphDef(partition_graph_def);
     }
   }
-  metrics::UpdateGraphExecTime(options_.env->NowMicros() - start_time_usecs);
+  const uint64 time_duration_usecs = options_.env->NowMicros() - start_time_usecs;
+  metrics::UpdateGraphExecTime(time_duration_usecs);
+
+  // Running all post session run action in grouping
+  uint64 session_end_time = tensorflow::Env::Default()->NowMicros();
+  action_options.sess_duration_us = time_duration_usecs;
+  action_options.graph_id = reinterpret_cast<uint64>(executors_and_keys);
+  TF_RETURN_IF_ERROR(SessionRunActionRegistry::Global()->RunGrouping(
+      SessionRunActionRegistry::POST_SESSION_RUN, action_options));
 
   return Status::OK();
 }
