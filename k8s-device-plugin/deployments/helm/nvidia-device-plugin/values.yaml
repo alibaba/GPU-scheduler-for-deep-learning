@@ -1,0 +1,36 @@
+legacyDaemonsetAPI: false
+compatWithCPUManager: false
+migStrategy: none
+failOnInitError: true
+deviceListStrategy: envvar
+
+nameOverride: ""
+fullnameOverride: ""
+selectorLabelsOverride: {}
+
+namespace: kube-system
+
+imagePullSecrets: []
+image:
+  repository: nvidia/k8s-device-plugin
+  pullPolicy: IfNotPresent
+  # Overrides the image tag whose default is the chart appVersion.
+  tag: ""
+
+updateStrategy:
+  type: RollingUpdate
+
+podSecurityContext: {}
+securityContext: {}
+
+resources: {}
+nodeSelector: {}
+affinity: {}
+tolerations:
+  # This toleration is deprecated. Kept here for backward compatibility
+  # See https://kubernetes.io/docs/tasks/administer-cluster/guaranteed-scheduling-critical-addon-pods/
+  - key: CriticalAddonsOnly
+    operator: Exists
+  - key: nvidia.com/gpu
+    operator: Exists
+    effect: NoSchedule
