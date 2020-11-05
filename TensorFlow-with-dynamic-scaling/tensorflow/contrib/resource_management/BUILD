@@ -49,3 +49,45 @@ tf_cc_test(
         "//tensorflow/core:test_main",
     ],
 )
+
+tf_cuda_library(
+    name = "gpu_usage_adjustment",
+    srcs = ["gpu_usage_adjustment.cc"],
+    hdrs = ["gpu_usage_adjustment.h"],
+    copts = ["-I/usr/include/"],
+    linkopts = ["-L/usr/lib64/", "-lcrypto"],
+    deps = [
+        "//tensorflow/core:lib",
+        "//tensorflow/core:gpu_runtime",
+    ],
+)
+
+tf_cuda_library(
+    name = "gpu_resource_management",
+    srcs = ["gpu_resource_management.cc"],
+    hdrs = ["gpu_resource_management.h"],
+    copts = ["-I/usr/include/"],
+    linkopts = ["-L/usr/lib64/", "-lcrypto"],
+    deps = [
+        ":file_listener",
+        ":gpu_usage_adjustment",
+        "//tensorflow/core:lib",
+        "@jsoncpp_git//:jsoncpp",
+    ],
+)
+
+tf_cuda_cc_test(
+    name = "gpu_resource_management_test",
+    size = "small",
+    srcs = ["gpu_resource_management_test.cc"],
+    deps = [
+        ":gpu_resource_management",
+        "//tensorflow/core:test",
+        "//tensorflow/core:test_main",
+        "//tensorflow/core:lib",
+        "//tensorflow/core:core_cpu",
+        "//tensorflow/core:core_cpu_base",
+        "//tensorflow/core:direct_session",
+        "//tensorflow/core:protos_all_cc",
+    ],
+)

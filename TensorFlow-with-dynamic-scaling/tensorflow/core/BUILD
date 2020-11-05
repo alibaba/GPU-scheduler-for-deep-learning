@@ -3406,6 +3406,7 @@ tf_cuda_library(
         "//tensorflow/core/profiler/lib:profiler_lib",
         "//tensorflow/core/profiler/lib:profiler_session",
         "//tensorflow/core/profiler/lib:traceme",
+        "//tensorflow/contrib/resource_management:gpu_resource_management",
         "@com_google_absl//absl/container:flat_hash_set",
     ],
     alwayslink = 1,
